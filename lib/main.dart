@@ -1,4 +1,7 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:video_player/video_player.dart';
 
 void main() {
@@ -13,13 +16,16 @@ class AiVideoApp extends StatelessWidget {
     return MaterialApp(
       title: 'KI-Regisseur Video App',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF0D0E15),
-        primaryColor: const Color(0xFF7C3AED),
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF7C3AED),
           secondary: Color(0xFFA855F7),
           surface: Color(0xFF161822),
+          surfaceContainerHigh: Color(0xFF232636),
         ),
       ),
       home: const ChatDirectorScreen(),
@@ -32,6 +38,7 @@ class ChatMessage {
   final bool isUser;
   final String text;
   final String? videoUrl;
+  final String? generationId;
   final bool isLoading;
 
   ChatMessage({
@@ -39,6 +46,7 @@ class ChatMessage {
     required this.isUser,
     required this.text,
     this.videoUrl,
+    this.generationId,
     this.isLoading = false,
   });
 }
@@ -55,6 +63,10 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
   final ScrollController _scrollController = ScrollController();
   final List<ChatMessage> _messages = [];
 
+  final String backendBaseUrl = "https://dein-backend-service.onrender.com";
+  final String demoUserId = "8d1e1f2a-3b4c-5d6e-7f8a-9b0c1d2e3f4a";
+  int userCredits = 10;
+
   @override
   void initState() {
     super.initState();
@@ -67,9 +79,21 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
     );
   }
 
-  void _sendMessage() {
+  @override
+  void dispose() {
+    _promptController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendMessage() async {
     final text = _promptController.text.trim();
     if (text.isEmpty) return;
+
+    if (userCredits <= 0) {
+      _showPaywallDialog();
+      return;
+    }
 
     _promptController.clear();
     final userMsgId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -79,27 +103,144 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
       _messages.add(ChatMessage(
         id: 'loading_$userMsgId',
         isUser: false,
-        text: 'KI-Regisseur optimiert den Prompt & rendert das Video...',
+        text: 'KI-Regisseur optimiert den Prompt & startet Rendering...',
         isLoading: true,
       ));
+      userCredits -= 1;
     });
 
     _scrollToBottom();
 
-    // Simulation der KI-Video-Generierung
-    Future.delayed(const Duration(seconds: 5), () {
+    try {
+      final response = await http.post(
+        Uri.parse('$backendBaseUrl/api/v1/generate-video'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'user_id': demoUserId,
+          'raw_prompt': text,
+          'aspect_ratio': '16:9',
+        }),
+      ).timeout(const Duration(seconds: 4));
+
       if (!mounted) return;
-      setState(() {
-        _messages.removeWhere((m) => m.id == 'loading_$userMsgId');
-        _messages.add(ChatMessage(
-          id: 'video_$userMsgId',
-          isUser: false,
-          text: 'Hier ist dein fertig gerendertes Video:',
-          videoUrl: 'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
-        ));
-      });
-      _scrollToBottom();
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        _startStatusPolling(data['generation_id'], userMsgId);
+      } else if (response.statusCode == 402) {
+        _handleGenerationError(userMsgId, 'Nicht genügend Credits.');
+        _showPaywallDialog();
+      } else {
+        _simulateDemoVideo(userMsgId);
+      }
+    } catch (_) {
+      if (mounted) {
+        _simulateDemoVideo(userMsgId);
+      }
+    }
+  }
+
+  void _startStatusPolling(String generationId, String userMsgId) {
+    Timer.periodic(const Duration(seconds: 3), (timer) async {
+      try {
+        final res = await http.get(
+          Uri.parse('$backendBaseUrl/api/v1/generation-status/$generationId'),
+        );
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data['status'] == 'completed') {
+            timer.cancel();
+            _completeVideoGeneration(userMsgId, data['video_url'], generationId);
+          } else if (data['status'] == 'failed') {
+            timer.cancel();
+            setState(() => userCredits += 1);
+            _handleGenerationError(userMsgId, 'Rendering fehlgeschlagen. Credit erstattet.');
+          }
+        }
+      } catch (_) {
+        timer.cancel();
+        if (mounted) {
+          _simulateDemoVideo(userMsgId);
+        }
+      }
     });
+  }
+
+  void _simulateDemoVideo(String userMsgId) {
+    Future.delayed(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      _completeVideoGeneration(
+        userMsgId,
+        'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
+        'demo_gen_id',
+      );
+    });
+  }
+
+  void _completeVideoGeneration(String userMsgId, String videoUrl, String genId) {
+    setState(() {
+      _messages.removeWhere((m) => m.id == 'loading_$userMsgId');
+      _messages.add(ChatMessage(
+        id: 'video_$userMsgId',
+        isUser: false,
+        text: 'Hier ist dein fertig gerendertes Video:',
+        videoUrl: videoUrl,
+        generationId: genId,
+      ));
+    });
+    _scrollToBottom();
+  }
+
+  void _handleGenerationError(String userMsgId, String errorText) {
+    setState(() {
+      _messages.removeWhere((m) => m.id == 'loading_$userMsgId');
+      _messages.add(ChatMessage(
+        id: 'err_$userMsgId',
+        isUser: false,
+        text: 'Fehler: $errorText',
+      ));
+    });
+    _scrollToBottom();
+  }
+
+  void _showPaywallDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF161822),
+        title: const Row(
+          children: [
+            Icon(Icons.bolt, color: Colors.amber),
+            SizedBox(width: 8),
+            Text('Keine Credits mehr!'),
+          ],
+        ),
+        content: const Text(
+          'Hole dir neue Credits, um weitere KI-Videos mit dem KI-Regisseur zu generieren.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Abbrechen', style: TextStyle(color: Colors.grey)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF7C3AED),
+            ),
+            onPressed: () {
+              setState(() => userCredits += 10);
+              Navigator.pop(context);
+            },
+            child: const Text('10 Credits kaufen (€2.99)'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _scrollToBottom() {
@@ -143,20 +284,25 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
           ],
         ),
         actions: [
-          Container(
-            margin: const EdgeInsets.only(right: 16),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF232636),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: const Color(0xFF7C3AED).withAlpha(100)),
-            ),
-            child: const Row(
-              children: [
-                Icon(Icons.bolt, color: Colors.amber, size: 16),
-                SizedBox(width: 4),
-                Text('10 Credits', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-              ],
+          GestureDetector(
+            onTap: _showPaywallDialog,
+            child: Container(
+              margin: const EdgeInsets.only(right: 16),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF232636),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: const Color(0xFF7C3AED).withValues(alpha: 0.4),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.bolt, color: Colors.amber, size: 16),
+                  const SizedBox(width: 4),
+                  Text('$userCredits Credits', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                ],
+              ),
             ),
           ),
         ],
@@ -197,9 +343,9 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
           ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withAlpha(30),
-              blurRadius: 6,
-              offset: const Offset(0, 3),
+              color: Colors.black.withValues(alpha: 0.2),
+              blurRadius: 4,
+              offset: const Offset(0, 2),
             ),
           ],
         ),
@@ -231,7 +377,12 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
             ],
             if (msg.videoUrl != null) ...[
               const SizedBox(height: 10),
-              VideoCardWidget(videoUrl: msg.videoUrl!),
+              VideoCardWidget(
+                videoUrl: msg.videoUrl!,
+                generationId: msg.generationId,
+                backendUrl: backendBaseUrl,
+                userId: demoUserId,
+              ),
             ],
           ],
         ),
@@ -274,6 +425,7 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
             const SizedBox(width: 8),
             InkWell(
               onTap: _sendMessage,
+              borderRadius: BorderRadius.circular(25),
               child: Container(
                 padding: const EdgeInsets.all(12),
                 decoration: const BoxDecoration(
@@ -292,7 +444,17 @@ class _ChatDirectorScreenState extends State<ChatDirectorScreen> {
 
 class VideoCardWidget extends StatefulWidget {
   final String videoUrl;
-  const VideoCardWidget({super.key, required this.videoUrl});
+  final String? generationId;
+  final String backendUrl;
+  final String userId;
+
+  const VideoCardWidget({
+    super.key,
+    required this.videoUrl,
+    this.generationId,
+    required this.backendUrl,
+    required this.userId,
+  });
 
   @override
   State<VideoCardWidget> createState() => _VideoCardWidgetState();
@@ -301,13 +463,16 @@ class VideoCardWidget extends StatefulWidget {
 class _VideoCardWidgetState extends State<VideoCardWidget> {
   late VideoPlayerController _controller;
   bool _isInitialized = false;
+  int _feedbackGiven = 0;
 
   @override
   void initState() {
     super.initState();
     _controller = VideoPlayerController.networkUrl(Uri.parse(widget.videoUrl))
       ..initialize().then((_) {
-        setState(() => _isInitialized = true);
+        if (mounted) {
+          setState(() => _isInitialized = true);
+        }
       });
   }
 
@@ -315,6 +480,24 @@ class _VideoCardWidgetState extends State<VideoCardWidget> {
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<void> _sendFeedback(int rating) async {
+    setState(() => _feedbackGiven = rating);
+    if (widget.generationId == null) return;
+
+    try {
+      await http.post(
+        Uri.parse('${widget.backendUrl}/api/v1/feedback'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'user_id': widget.userId,
+          'generation_id': widget.generationId,
+          'rating': rating,
+          'feedback_tags': rating == 1 ? ['cinematic'] : ['blurry'],
+        }),
+      );
+    } catch (_) {}
   }
 
   @override
@@ -346,7 +529,7 @@ class _VideoCardWidgetState extends State<VideoCardWidget> {
                   iconSize: 48,
                   icon: Icon(
                     _controller.value.isPlaying ? Icons.pause_circle : Icons.play_circle_fill,
-                    color: Colors.white.withAlpha(220),
+                    color: Colors.white.withValues(alpha: 0.85),
                   ),
                   onPressed: () {
                     setState(() {
@@ -358,18 +541,26 @@ class _VideoCardWidgetState extends State<VideoCardWidget> {
             ),
           ),
           Container(
-            padding: const EdgeInsets.all(8),
+            padding: const EdgeInsets.symmetric(vertical: 4),
             color: const Color(0xFF232636),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
                 IconButton(
-                  icon: const Icon(Icons.thumb_up_alt_outlined, color: Colors.greenAccent, size: 20),
-                  onPressed: () {},
+                  icon: Icon(
+                    Icons.thumb_up_alt,
+                    color: _feedbackGiven == 1 ? Colors.greenAccent : Colors.grey,
+                    size: 20,
+                  ),
+                  onPressed: () => _sendFeedback(1),
                 ),
                 IconButton(
-                  icon: const Icon(Icons.thumb_down_alt_outlined, color: Colors.redAccent, size: 20),
-                  onPressed: () {},
+                  icon: Icon(
+                    Icons.thumb_down_alt,
+                    color: _feedbackGiven == -1 ? Colors.redAccent : Colors.grey,
+                    size: 20,
+                  ),
+                  onPressed: () => _sendFeedback(-1),
                 ),
                 IconButton(
                   icon: const Icon(Icons.download_rounded, color: Colors.white70, size: 20),
